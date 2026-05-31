@@ -1,71 +1,41 @@
 extends RigidBody3D
 
-var shot_file = "/Users/zander/Desktop/hackathon2026/shot.json"
-var aim_file  = "/Users/zander/Desktop/hackathon2026/aim.json"
+var shot_file    = "/Users/zander/Desktop/hackathon2026/shot.json"
+var command_file = "/Users/zander/Desktop/hackathon2026/command.json"
+var status_file  = "/Users/zander/Desktop/hackathon2026/status.json"
 
 var should_reset   = false
 var start_position = Vector3.ZERO
 var has_shot       = false
+var has_moved      = false
 var arrow_angle    = 0.0      # current arrow angle (degrees)
+var slow_frames    = 0        # consecutive frames below stop threshold
 
-var arrow_pivot: Node3D       # child of ball, holds the arrow
+# phase: "START" (arrow-key aim) -> "PUTTER" (after S) -> "LOCKED" (after L) -> "DONE"
+var phase = "START"
+
+var arrow_pivot: Node3D
 var arrow_mesh: MeshInstance3D
 
-@export var default_angle: float  = 0.0
-@export var arrow_distance: float = 0.45
-@export var power_scale: float    = 20.0
-@export var rolling_friction: float = 4.0  # constant deceleration force
-
-
-var has_moved = false   # becomes true once ball is actually rolling
-
-
-func _physics_process(delta):
-	if has_shot and not freeze:
-		var vel = linear_velocity
-		var speed = vel.length()
-
-		# wait until the ball is actually moving before allowing stop detection
-		if speed > 0.5:
-			has_moved = true
-
-		if speed > 0.01:
-			var decel = rolling_friction * delta
-			if decel >= speed:
-				linear_velocity = Vector3.ZERO
-				angular_velocity = Vector3.ZERO
-				if has_moved:
-					_on_ball_stopped()
-			else:
-				apply_central_force(-vel.normalized() * rolling_friction)
-		elif has_moved:
-			_on_ball_stopped()
-
-
-func _on_ball_stopped():
-	# ball has come to rest after a shot: re-arm from this new position
-	has_shot = false
-	has_moved = false
-	start_position = global_position   # new resting spot becomes the reset point
-	# flatten any roll tilt so the parented arrow sits flat
-	global_rotation = Vector3.ZERO
-	arrow_angle = default_angle
-	arrow_pivot.visible = true
-	_update_arrow_visual()
-	# freeze so it stays still and flat while aiming the next shot
-	freeze = true
+@export var default_angle: float    = 0.0
+@export var arrow_distance: float   = 0.45
+@export var power_scale: float      = 20.0
+@export var rolling_friction: float = 2.0
+@export var arrow_key_step: float   = 5.0   # degrees per arrow-key press
+@export var stop_speed: float       = 0.3   # below this speed = "slow"
+@export var stop_frames_needed: int = 30    # must be slow this many frames to stop
 
 
 func _ready():
 	start_position = global_position
 	arrow_angle = default_angle
 	freeze_mode = RigidBody3D.FREEZE_MODE_KINEMATIC
-	freeze = true   # stay still and flat until shot fired
+	freeze = true
 	_create_arrow()
+	_write_command("START")
 
 
 func _create_arrow():
-	# pivot is a child of the ball, sits at ball center
 	arrow_pivot = Node3D.new()
 	add_child(arrow_pivot)
 
@@ -84,33 +54,83 @@ func _create_arrow():
 	arrow_mesh.material_override = mat
 
 	arrow_pivot.add_child(arrow_mesh)
-
-	# cone flat along pivot +X
 	arrow_mesh.rotation = Vector3(0.0, 0.0, deg_to_rad(-90.0))
 	arrow_mesh.position = Vector3(arrow_distance, 0.0, 0.0)
 
 
 func _update_arrow_visual():
-	# pivot only rotates on Y; because we freeze ball rotation, this stays flat
 	arrow_pivot.rotation = Vector3(0.0, deg_to_rad(-arrow_angle), 0.0)
+
+
+func _write_command(cmd: String):
+	var f = FileAccess.open(command_file, FileAccess.WRITE)
+	if f:
+		f.store_string(JSON.stringify({"phase": cmd}))
+		f.close()
+
+
+func _physics_process(delta):
+	if has_shot and not freeze:
+		var vel = linear_velocity
+		var speed = vel.length()
+
+		if speed > 0.5:
+			has_moved = true
+
+		# apply constant rolling friction opposing horizontal motion
+		var horiz = Vector3(vel.x, 0.0, vel.z)
+		var horiz_speed = horiz.length()
+		if horiz_speed > 0.01:
+			var decel = rolling_friction * delta
+			if decel < horiz_speed:
+				apply_central_force(-horiz.normalized() * rolling_friction)
+
+		# stop detection: require sustained low speed, not a single slow frame.
+		# this prevents freezing mid-slope when the ball briefly slows.
+		if has_moved and speed < stop_speed:
+			slow_frames += 1
+		else:
+			slow_frames = 0
+
+		if slow_frames >= stop_frames_needed:
+			linear_velocity = Vector3.ZERO
+			angular_velocity = Vector3.ZERO
+			_on_ball_stopped()
+
+
+func _on_ball_stopped():
+	has_shot = false
+	has_moved = false
+	slow_frames = 0
+	start_position = global_position
+	global_rotation = Vector3.ZERO
+	arrow_angle = default_angle
+	arrow_pivot.visible = true
+	_update_arrow_visual()
+	freeze = true
+	phase = "START"
+	_write_command("START")
 
 
 func _process(_delta):
 	if has_shot:
 		return
 
-	# AIM phase: arrow follows putter live
-	# LOCKED phase: arrow frozen (Python stops writing aim.json after lock,
-	#               or writes the offset — handled by aim.json contents)
-	if arrow_pivot.visible and FileAccess.file_exists(aim_file):
-		var file = FileAccess.open(aim_file, FileAccess.READ)
-		var data = JSON.parse_string(file.get_as_text())
-		file.close()
-		if data and data.has("angle"):
-			arrow_angle = default_angle + data["angle"]
-			_update_arrow_visual()
+	# while waiting in LOCKED, check if Python rejected the lock
+	if phase == "LOCKED" and FileAccess.file_exists(status_file):
+		var sf = FileAccess.open(status_file, FileAccess.READ)
+		var sdata = JSON.parse_string(sf.get_as_text())
+		sf.close()
+		if sdata and sdata.get("status", "") == "LOCK_FAILED":
+			phase = "PUTTER"
+			print("Lock failed - putter not visible. Press L again.")
+			DirAccess.remove_absolute(status_file)
 
-	# poll for shot
+	if phase != "LOCKED":
+		if FileAccess.file_exists(shot_file):
+			DirAccess.remove_absolute(shot_file)
+		return
+
 	if FileAccess.file_exists(shot_file):
 		var file = FileAccess.open(shot_file, FileAccess.READ)
 		var data = JSON.parse_string(file.get_as_text())
@@ -118,50 +138,74 @@ func _process(_delta):
 		if data and data.get("impact_detected", false):
 			apply_shot(data["ball_speed"], data["ball_angle"])
 			has_shot = true
+			phase = "DONE"
 			DirAccess.remove_absolute(shot_file)
 
 
 func apply_shot(speed: float, offset_degrees: float):
-	# ball travels at arrow direction + the off-straight offset
 	var total_angle = arrow_angle + offset_degrees
 	var rad = deg_to_rad(total_angle)
 	var direction = Vector3(cos(rad), 0.0, sin(rad))
-	print("SHOT applied: speed=", speed, " power=", speed * power_scale, " dir=", direction)
-	# unfreeze so it can roll
 	freeze = false
-	# apply impulse next physics frame to ensure unfreeze has taken effect
+	slow_frames = 0
 	call_deferred("_launch", direction * speed * power_scale)
 	arrow_pivot.visible = false
+
+
 func _launch(impulse: Vector3):
 	linear_velocity = Vector3.ZERO
 	angular_velocity = Vector3.ZERO
+	var min_power = rolling_friction * 2.0
+	if impulse.length() < min_power:
+		impulse = impulse.normalized() * min_power
 	apply_central_impulse(impulse)
-	print("Launched, velocity now: ", linear_velocity)
 
 
 func reset_ball():
-	print("RESET")
 	has_shot = false
+	has_moved = false
+	slow_frames = 0
 	arrow_angle = default_angle
 	arrow_pivot.visible = true
 	_update_arrow_visual()
 	should_reset = true
+	phase = "START"
+	_write_command("START")
 
 
 func _integrate_forces(state):
 	if should_reset:
-		var t = Transform3D(Basis(), start_position)  # identity basis = flat
+		var t = Transform3D(Basis(), start_position)
 		state.transform = t
 		state.linear_velocity  = Vector3.ZERO
 		state.angular_velocity = Vector3.ZERO
 		should_reset = false
-		# re-freeze so ball stays still and flat while aiming next shot
 		freeze = true
 
 
 func _input(event):
-	if event is InputEventKey and event.pressed:
-		if event.keycode == KEY_SPACE:
-			apply_shot(0.7, 0.0)
-		elif event.keycode == KEY_R:
-			reset_ball()
+	if not (event is InputEventKey and event.pressed):
+		return
+
+	# START phase: arrow keys rotate the arrow
+	if phase == "START":
+		if event.keycode == KEY_LEFT:
+			arrow_angle -= arrow_key_step
+			_update_arrow_visual()
+		elif event.keycode == KEY_RIGHT:
+			arrow_angle += arrow_key_step
+			_update_arrow_visual()
+		elif event.keycode == KEY_S:
+			phase = "PUTTER"
+			_write_command("PUTTER")
+			print("Arrow locked at ", arrow_angle, " deg. Line up putter, press L.")
+
+	elif phase == "PUTTER":
+		if event.keycode == KEY_L:
+			phase = "LOCKED"
+			_write_command("LOCKED")
+			print("Lock requested. Hit the ball (Python confirms putter visibility).")
+
+	# R resets from any phase
+	if event.keycode == KEY_R:
+		reset_ball()
